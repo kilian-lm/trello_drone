@@ -1,31 +1,13 @@
 #!/usr/bin/env python3
 """
 This script connects to a Tello drone, takes off, and scans the environment for retail store products
-(such as shower gels or products from German Drogeriemärkte like Müller, DM, Rossmann) using the 
-Google Cloud Vision API for object localization with explicit service account authentication.
-
-The drone will:
-  - Take off and search for the first product.
-  - Record the altitude when the first matching product is detected.
-  - Move in a scanning pattern (up, down, right, left) and capture additional detections.
-  - Log all detections (timestamp, altitude, scan direction, detected label, confidence score, and bounding box)
-    and write them to a CSV file.
-  - Land after the mission.
-
-Requirements:
-  - djitellopy (pip install djitellopy)
-  - opencv-python (pip install opencv-python)
-  - pandas (pip install pandas)
-  - google-cloud-vision (pip install google-cloud-vision)
-  - google-auth (pip install google-auth)
-
-Make sure to update SERVICE_ACCOUNT_FILE to point to your service account JSON key file.
+using the Google Cloud Vision API for object localization with explicit service account authentication.
+It also gracefully handles the case when the drone does not produce video data.
 """
 
 import cv2
 import time
 import pandas as pd
-import numpy as np
 import logging
 
 from djitellopy import Tello
@@ -44,7 +26,7 @@ logging.basicConfig(level=logging.INFO,
 # ----------------------------
 # Initialize Google Cloud Vision Client with Service Account Credentials
 # ----------------------------
-SERVICE_ACCOUNT_FILE = '/Users/d0342084/Documents/Git/trello_drone/image_recognition/stovi-infrastructure-73c3e5175-c427735bae33.json'  # <-- Update this path!
+SERVICE_ACCOUNT_FILE = '/Users/d0342084/Documents/Git/trello_drone/image_recognition/some_unwanted_creatre.json'  # <-- Update this path!
 
 try:
     logging.info("Loading service account credentials for Google Cloud Vision API...")
@@ -83,10 +65,13 @@ def run_detection(frame):
     """
     Send the provided frame to the Cloud Vision API's object localization endpoint and return the detections
     as a pandas DataFrame with columns: 'name', 'confidence', 'xmin', 'ymin', 'xmax', 'ymax'.
-
-    The bounding boxes are computed from the normalized vertices returned by the API.
     """
     try:
+        # Ensure frame is valid
+        if frame is None:
+            logging.error("No frame provided to run_detection.")
+            return pd.DataFrame()
+
         # Encode the frame as JPEG.
         ret, buffer = cv2.imencode('.jpg', frame)
         if not ret:
@@ -119,8 +104,7 @@ def run_detection(frame):
                 "ymax": int(ymax)
             })
 
-        df = pd.DataFrame(detections_list)
-        return df
+        return pd.DataFrame(detections_list)
 
     except Exception as e:
         logging.error(f"Error in run_detection: {e}")
@@ -134,12 +118,6 @@ def scan_direction(tello, direction, distance_cm, scan_pause=2):
     """
     Move the drone in the given direction by the specified distance, pause to capture a frame,
     run object detection on that frame via the Cloud Vision API, and log any detections found.
-
-    Parameters:
-      tello      : the Tello drone instance.
-      direction  : one of "up", "down", "left", "right".
-      distance_cm: distance to move (in centimeters).
-      scan_pause : seconds to wait after movement before capturing a frame.
     """
     try:
         if direction == "up":
@@ -160,19 +138,22 @@ def scan_direction(tello, direction, distance_cm, scan_pause=2):
 
         time.sleep(scan_pause)  # Wait for movement to complete and scene stabilization.
 
-        frame = tello.get_frame_read().frame
+        try:
+            frame = tello.get_frame_read().frame
+        except Exception as ex:
+            logging.error(f"Error obtaining frame from drone: {ex}")
+            return
+
         if frame is None:
             logging.error("No frame captured during scanning.")
             return
 
         detections = run_detection(frame)
-        # Filter and log detections of interest.
         for idx, row in detections.iterrows():
             label = row['name']
             conf = row['confidence']
             bbox = (row['xmin'], row['ymin'], row['xmax'], row['ymax'])
-
-            # Check if the detection label contains keywords of interest.
+            # Check for keywords of interest.
             if ("shower" in label.lower() or
                     "müller" in label.lower() or
                     "dm" in label.lower() or
@@ -215,21 +196,27 @@ def main():
     first_article_altitude = None
     scanning_state = "searching"
 
-    # Run a loop for a set period (e.g., 60 seconds) to search for the first article.
+    # Run a loop (up to 60 seconds) to search for the first product.
     search_timeout = 60  # seconds.
     search_start = time.time()
     logging.info("Searching for initial product detection...")
 
     while time.time() - search_start < search_timeout:
-        frame = tello.get_frame_read().frame
+        try:
+            frame = tello.get_frame_read().frame
+        except Exception as ex:
+            logging.error(f"Error obtaining frame from drone: {ex}")
+            continue
+
         if frame is None:
+            logging.warning("Drone did not produce any frame; waiting...")
+            time.sleep(1)
             continue
 
         # Optionally, resize the frame to speed up processing.
         resized_frame = cv2.resize(frame, (640, 480))
         detections = run_detection(resized_frame)
 
-        # Check each detection – if we see a product of interest.
         if not detections.empty:
             for idx, row in detections.iterrows():
                 label = row['name']
@@ -240,18 +227,15 @@ def main():
                         "dm" in label.lower() or
                         "rossmann" in label.lower()):
                     current_alt = tello.get_height()
-                    # Record the altitude of the first detected product.
                     if first_article_altitude is None:
                         first_article_altitude = current_alt
                         logging.info(f"First product detected at altitude {first_article_altitude} cm.")
-                    # Log the detection (using direction "center" since no movement yet).
                     log_detection(time.time(), current_alt, "center", label, conf, bbox)
                     scanning_state = "scanning"
                     break
         if scanning_state == "scanning":
             break
 
-        # Optionally display the live feed (press 'q' to exit early).
         cv2.imshow("Tello Feed", resized_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             logging.info("User requested exit during search.")
@@ -260,59 +244,60 @@ def main():
     if first_article_altitude is None:
         logging.warning("No initial product detected during search.")
 
-    # If in scanning state, move in different directions to check for other articles.
     if scanning_state == "scanning":
         logging.info("Initiating scanning pattern: up, down, right, left.")
-        # Scan upward.
         scan_direction(tello, "up", 30)
-        # Scan downward (from up, so move down more to go below original altitude).
         scan_direction(tello, "down", 60)
-        # Return to original altitude.
         scan_direction(tello, "up", 30)
-        # Scan right.
         scan_direction(tello, "right", 30)
-        # Scan left (to return to center).
         scan_direction(tello, "left", 60)
-        # Return to center.
         scan_direction(tello, "right", 30)
     else:
         logging.info("No scanning performed since no product was detected initially.")
 
-    # Optionally continue a brief period of hovering and monitoring (here 5 seconds).
     logging.info("Monitoring for additional detections before landing...")
     hover_end = time.time() + 5
     while time.time() < hover_end:
-        frame = tello.get_frame_read().frame
-        if frame is not None:
-            resized_frame = cv2.resize(frame, (640, 480))
-            detections = run_detection(resized_frame)
-            for idx, row in detections.iterrows():
-                label = row['name']
-                conf = row['confidence']
-                bbox = (row['xmin'], row['ymin'], row['xmax'], row['ymax'])
-                if ("shower" in label.lower() or
-                        "müller" in label.lower() or
-                        "dm" in label.lower() or
-                        "rossmann" in label.lower()):
-                    log_detection(time.time(), tello.get_height(), "hover", label, conf, bbox)
+        try:
+            frame = tello.get_frame_read().frame
+        except Exception as ex:
+            logging.error(f"Error obtaining frame during hover: {ex}")
+            break
+
+        if frame is None:
+            logging.warning("No frame produced during hover.")
+            time.sleep(1)
+            continue
+
+        resized_frame = cv2.resize(frame, (640, 480))
+        detections = run_detection(resized_frame)
+        for idx, row in detections.iterrows():
+            label = row['name']
+            conf = row['confidence']
+            bbox = (row['xmin'], row['ymin'], row['xmax'], row['ymax'])
+            if ("shower" in label.lower() or
+                    "müller" in label.lower() or
+                    "dm" in label.lower() or
+                    "rossmann" in label.lower()):
+                log_detection(time.time(), tello.get_height(), "hover", label, conf, bbox)
         cv2.imshow("Tello Feed", resized_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Save the detection logs to a CSV file.
     logging.info("Writing detection logs to detections.csv...")
-    df = pd.DataFrame(detections_log)
-    df.to_csv("detections.csv", index=False)
-    logging.info("Detection log saved.")
+    try:
+        df = pd.DataFrame(detections_log)
+        df.to_csv("detections.csv", index=False)
+        logging.info("Detection log saved.")
+    except Exception as e:
+        logging.error(f"Error writing CSV file: {e}")
 
-    # Land the drone.
     logging.info("Landing...")
     try:
         tello.land()
     except Exception as e:
         logging.error(f"Error during landing: {e}")
 
-    # Shut down the video stream and close any OpenCV windows.
     tello.streamoff()
     cv2.destroyAllWindows()
     logging.info("Mission complete.")
