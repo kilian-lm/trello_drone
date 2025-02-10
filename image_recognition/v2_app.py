@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
 """
-Example script to connect to a Tello drone, take off, and detect retail store products
-using Google Cloud Vision's Label Detection and Logo Detection, with explicit
-service account credentials.
+Script that connects to a Tello drone, takes off, and scans for *any* recognized objects, labels, 
+or logos via the Google Cloud Vision API, using a service account for authentication.
+
+All recognized items are logged with bounding boxes (when available) and confidence scores.
 """
 
 import cv2
@@ -12,20 +12,21 @@ import logging
 
 from djitellopy import Tello
 
-# Google Cloud Vision
+# Import Google Cloud Vision client library and service account credentials
 from google.cloud import vision
 from google.oauth2 import service_account
 
-# ----------------------------
+# ----------------------------------------------------------------------
 # Configure Logging
-# ----------------------------
-logging.basicConfig(level=logging.INFO,
+# ----------------------------------------------------------------------
+# Set level to DEBUG to see all details (including detection details).
+logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s [%(levelname)s] %(message)s',
                     datefmt='%H:%M:%S')
 
-# ----------------------------
+# ----------------------------------------------------------------------
 # Initialize Google Cloud Vision Client with Service Account Credentials
-# ----------------------------
+# ----------------------------------------------------------------------
 SERVICE_ACCOUNT_FILE = "/Users/d0342084/Documents/Git/trello_drone/image_recognition/some_unwanted_creatre.json"  # <-- Update this path!
 
 try:
@@ -37,72 +38,108 @@ except Exception as e:
     logging.error(f"Failed to initialize Cloud Vision API client: {e}")
     exit(1)
 
-# ----------------------------
+# ----------------------------------------------------------------------
 # Global Data Storage for Detections
-# ----------------------------
-# Each detection entry will include: timestamp, altitude (cm), scan direction, label, confidence, bbox.
+# ----------------------------------------------------------------------
+# Each detection entry will include:
+# timestamp, altitude (cm), scan direction, label, confidence, bbox.
 detections_log = []
 
 def log_detection(timestamp, altitude, direction, label, confidence, bbox):
-    """Append a detection entry to the global log."""
+    """
+    Append a detection entry to the global detections_log list.
+    bbox is a tuple (xmin, ymin, xmax, ymax); can be None or partially None if not provided by the API.
+    """
     entry = {
         "timestamp": timestamp,
         "altitude_cm": altitude,
         "direction": direction,
         "label": label,
         "confidence": confidence,
-        "bbox": bbox  # (xmin, ymin, xmax, ymax) or (None, None, None, None) if not available
+        "bbox": bbox
     }
     detections_log.append(entry)
     logging.info(f"Detection logged: {entry}")
 
 
-# ----------------------------
-# Helper: Run Label + Logo Detection on a Frame
-# ----------------------------
+# ----------------------------------------------------------------------
+# Helper: Run All Vision Detections on a Frame (Object + Label + Logo)
+# ----------------------------------------------------------------------
 def run_detection(frame):
     """
-    Send the provided frame to the Cloud Vision API for both label detection and logo detection.
-    Return a pandas DataFrame with columns: 'name', 'confidence', 'xmin', 'ymin', 'xmax', 'ymax', 'type'.
-
-    - For label detections, bounding box columns will be None, 'type' will be "label".
-    - For logo detections, bounding box is taken from the bounding_poly. 'type' will be "logo".
+    Calls Object Localization, Label Detection, *and* Logo Detection on the given frame.
+    Returns a pandas DataFrame with columns:
+      - 'name' (the detected object/label/logo)
+      - 'confidence' (float)
+      - 'xmin', 'ymin', 'xmax', 'ymax' (bounding box in pixel coords, or None if not applicable)
+      - 'type' in ['object', 'label', 'logo']
     """
     if frame is None:
         logging.error("No frame provided to run_detection.")
         return pd.DataFrame()
 
     try:
-        # Encode the frame as JPEG.
+        # Encode the frame as JPEG
         success, buffer = cv2.imencode('.jpg', frame)
         if not success:
             logging.error("Failed to encode frame as JPEG.")
             return pd.DataFrame()
-        content = buffer.tobytes()
 
-        # Prepare the image for the Vision API
+        content = buffer.tobytes()
         image = vision.Image(content=content)
 
-        # 1) Label Detection
+        # 1) Object Localization
+        obj_response = vision_client.object_localization(image=image)
+        if obj_response.error.message:
+            logging.error(f"Vision API (object localization) error: {obj_response.error.message}")
+            return pd.DataFrame()
+
+        # 2) Label Detection
         label_response = vision_client.label_detection(image=image)
         if label_response.error.message:
-            logging.error(f"Vision API (label) error: {label_response.error.message}")
+            logging.error(f"Vision API (label detection) error: {label_response.error.message}")
             return pd.DataFrame()
 
-        # 2) Logo Detection
+        # 3) Logo Detection
         logo_response = vision_client.logo_detection(image=image)
         if logo_response.error.message:
-            logging.error(f"Vision API (logo) error: {logo_response.error.message}")
+            logging.error(f"Vision API (logo detection) error: {logo_response.error.message}")
             return pd.DataFrame()
 
-        # Build a combined list of detections
         detections_list = []
+        height, width = frame.shape[:2]
 
-        # --- Parse label annotations ---
-        for annotation in label_response.label_annotations:
+        # ------------------------------------------------
+        # Parse Object Localization results
+        # ------------------------------------------------
+        logging.debug("=== Object Localization Annotations ===")
+        for annotation in obj_response.localized_object_annotations:
+            logging.debug(f"Object: {annotation.name}, Score: {annotation.score}")
+            # Convert normalized bounding box to pixel coords
+            xs = [v.x * width for v in annotation.bounding_poly.normalized_vertices]
+            ys = [v.y * height for v in annotation.bounding_poly.normalized_vertices]
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
             detections_list.append({
-                "name": annotation.description,
+                "name": annotation.name,
                 "confidence": annotation.score,
+                "xmin": int(xmin),
+                "ymin": int(ymin),
+                "xmax": int(xmax),
+                "ymax": int(ymax),
+                "type": "object"
+            })
+
+        # ------------------------------------------------
+        # Parse Label Detection results
+        # ------------------------------------------------
+        logging.debug("=== Label Detection Annotations ===")
+        for lbl in label_response.label_annotations:
+            logging.debug(f"Label: {lbl.description}, Score: {lbl.score}")
+            # Label detection doesn't provide bounding boxes
+            detections_list.append({
+                "name": lbl.description,
+                "confidence": lbl.score,
                 "xmin": None,
                 "ymin": None,
                 "xmax": None,
@@ -110,9 +147,13 @@ def run_detection(frame):
                 "type": "label"
             })
 
-        # --- Parse logo annotations (includes bounding polygons) ---
+        # ------------------------------------------------
+        # Parse Logo Detection results
+        # ------------------------------------------------
+        logging.debug("=== Logo Detection Annotations ===")
         for logo in logo_response.logo_annotations:
-            # Each logo can have a bounding_poly
+            logging.debug(f"Logo: {logo.description}, Score: {logo.score}")
+            # Logo detection bounding box is in bounding_poly.vertices
             vertices = logo.bounding_poly.vertices
             if len(vertices) == 4:
                 xs = [v.x for v in vertices if v.x is not None]
@@ -121,10 +162,9 @@ def run_detection(frame):
                     xmin, xmax = min(xs), max(xs)
                     ymin, ymax = min(ys), max(ys)
                 else:
-                    xmin = xmax = ymin = ymax = 0
+                    xmin = xmax = ymin = ymax = None
             else:
-                # Fallback if bounding_poly is missing or unexpected
-                xmin = xmax = ymin = ymax = 0
+                xmin = xmax = ymin = ymax = None
 
             detections_list.append({
                 "name": logo.description,
@@ -143,13 +183,13 @@ def run_detection(frame):
         return pd.DataFrame()
 
 
-# ----------------------------
+# ----------------------------------------------------------------------
 # Helper: Scan in a Given Direction
-# ----------------------------
+# ----------------------------------------------------------------------
 def scan_direction(tello, direction, distance_cm, scan_pause=2, min_conf=0.5):
     """
-    Move the drone in a given direction by distance_cm, pause, capture a frame,
-    run detection, and log *all* detections above min_conf confidence.
+    Move the drone in the given direction by distance_cm, pause, capture a frame,
+    run detection, and log all detections above the confidence threshold.
     """
     try:
         # Move in specified direction
@@ -166,26 +206,25 @@ def scan_direction(tello, direction, distance_cm, scan_pause=2, min_conf=0.5):
             logging.info(f"Moving right {distance_cm} cm")
             tello.move_right(distance_cm)
         else:
-            logging.warning("Unknown direction command.")
+            logging.warning(f"Unknown direction command: {direction}")
             return
 
         # Pause briefly for stability
         time.sleep(scan_pause)
 
-        # Get a frame from drone
+        # Get a frame from the drone
         frame = tello.get_frame_read().frame
         if frame is None:
             logging.error("No frame captured during scanning.")
             return
 
-        # Run detection (labels + logos)
+        # Run detection (objects, labels, logos)
         detections = run_detection(frame)
         for _, row in detections.iterrows():
             label = row['name']
             conf = row['confidence']
             bbox = (row['xmin'], row['ymin'], row['xmax'], row['ymax'])
-
-            # Log all recognized labels/logos above the confidence threshold
+            # Log everything above the threshold
             if conf >= min_conf:
                 current_alt = tello.get_height()
                 log_detection(time.time(), current_alt, direction, label, conf, bbox)
@@ -194,9 +233,9 @@ def scan_direction(tello, direction, distance_cm, scan_pause=2, min_conf=0.5):
         logging.error(f"Error during scan in direction '{direction}': {e}")
 
 
-# ----------------------------
+# ----------------------------------------------------------------------
 # Main Flight & Detection Routine
-# ----------------------------
+# ----------------------------------------------------------------------
 def main():
     # Initialize and connect to the Tello drone
     tello = Tello()
@@ -221,17 +260,16 @@ def main():
         logging.error(f"Takeoff failed: {e}")
         return
 
-    # Variables to record the first detection altitude
+    # Variables to record first detection altitude
     first_article_altitude = None
     scanning_state = "searching"
 
-    # Search for up to 60 seconds for an initial product detection
+    # Search for up to 60 seconds for a detection
     search_timeout = 60
     search_start = time.time()
     logging.info("Searching for initial product detection...")
 
     while time.time() - search_start < search_timeout:
-        # Attempt to retrieve a frame
         frame = None
         try:
             frame = tello.get_frame_read().frame
@@ -245,41 +283,36 @@ def main():
             time.sleep(1)
             continue
 
-        # Optionally resize the frame (keep at decent size so text/logos are readable)
+        # Optionally resize frame so it's not huge, but keep it large enough for clarity
         resized_frame = cv2.resize(frame, (640, 480))
 
-        # Run detection on the frame
+        # Run detection on current frame
         detections = run_detection(resized_frame)
 
+        # If we have anything recognized, log it & mark scanning
         if not detections.empty:
+            # (You could add a confidence threshold here if desired)
             for _, row in detections.iterrows():
                 label = row['name']
                 conf = row['confidence']
                 bbox = (row['xmin'], row['ymin'], row['xmax'], row['ymax'])
-                # Check if it matches your keywords
-                if ("shower" in label.lower() or
-                        "shampoo" in label.lower() or
-                        "müller" in label.lower() or
-                        "dm" in label.lower() or
-                        "rossmann" in label.lower()):
-                    current_alt = tello.get_height()
-                    if first_article_altitude is None:
-                        first_article_altitude = current_alt
-                        logging.info(f"First product detected at altitude {first_article_altitude} cm.")
-                    log_detection(time.time(), current_alt, "center", label, conf, bbox)
-                    scanning_state = "scanning"
-                    break
-        if scanning_state == "scanning":
+                current_alt = tello.get_height()
+                log_detection(time.time(), current_alt, "center", label, conf, bbox)
+
+            if first_article_altitude is None:
+                first_article_altitude = tello.get_height()
+                logging.info(f"First detection found at altitude {first_article_altitude} cm.")
+            scanning_state = "scanning"
             break
 
-        # Show debug stream
+        # Show debug feed
         cv2.imshow("Tello Feed", resized_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             logging.info("User requested exit during search.")
             break
 
     if first_article_altitude is None:
-        logging.warning("No initial product detected during the search phase.")
+        logging.warning("No product or item detected during the search phase.")
 
     # If something was detected, run a scanning pattern
     if scanning_state == "scanning":
@@ -291,7 +324,7 @@ def main():
         scan_direction(tello, "left", 60)
         scan_direction(tello, "right", 30)
     else:
-        logging.info("No scanning pattern performed (no product initially detected).")
+        logging.info("No scanning pattern performed (nothing detected initially).")
 
     # Hover a few seconds more to check for additional detections
     logging.info("Monitoring for additional detections before landing...")
@@ -310,23 +343,21 @@ def main():
 
         resized_frame = cv2.resize(frame, (640, 480))
         detections = run_detection(resized_frame)
-
         for _, row in detections.iterrows():
             label = row['name']
             conf = row['confidence']
             bbox = (row['xmin'], row['ymin'], row['xmax'], row['ymax'])
-            if ("shower" in label.lower() or
-                    "shampoo" in label.lower() or
-                    "müller" in label.lower() or
-                    "dm" in label.lower() or
-                    "rossmann" in label.lower()):
-                log_detection(time.time(), tello.get_height(), "hover", label, conf, bbox)
+
+            # Log everything above some minimal confidence
+            if conf >= 0.5:
+                current_alt = tello.get_height()
+                log_detection(time.time(), current_alt, "hover", label, conf, bbox)
 
         cv2.imshow("Tello Feed", resized_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Write detections to CSV
+    # Write all detections to CSV
     logging.info("Writing detection logs to detections.csv...")
     try:
         df = pd.DataFrame(detections_log)
