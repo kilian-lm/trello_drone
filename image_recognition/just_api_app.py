@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import cv2
 import time
 import logging
@@ -9,13 +10,14 @@ from google.cloud import vision
 from google.oauth2 import service_account
 
 # --------------------------------------------------------------------
-# USER CONFIG - UPDATE THESE
+# CONFIG
 # --------------------------------------------------------------------
-SERVICE_ACCOUNT_FILE = "/Users/kilianlehn/Documents/GitHub/trello_drone/image_recognition/enter-universes-fcf7ca441146.json"  # <-- Update this path
+SERVICE_ACCOUNT_FILE = "/Users/kilianlehn/Documents/GitHub/trello_drone/image_recognition/enter-universes-fcf7ca441146.json"  # <-- Update path
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-LOGGING_LEVEL = logging.DEBUG  # DEBUG prints everything
-WAIT_BETWEEN_FRAMES = 0  # Seconds to wait after each frame (0 = no extra delay)
+LOGGING_LEVEL = logging.DEBUG
+WAIT_BETWEEN_FRAMES = 0  # If you want a delay after each frame
+SHOW_TOP_LABELS = 3       # How many labels to overlay on the image
 
 logging.basicConfig(
     level=LOGGING_LEVEL,
@@ -24,7 +26,7 @@ logging.basicConfig(
 )
 
 # --------------------------------------------------------------------
-# Setup Vision Client
+# Initialize Vision Client
 # --------------------------------------------------------------------
 try:
     logging.info("Loading service account credentials...")
@@ -36,56 +38,68 @@ except Exception as e:
     sys.exit(1)
 
 # --------------------------------------------------------------------
-# Combined Object Localization + Label Detection
+# Combined Detection: Objects, Labels, and Text (OCR)
 # --------------------------------------------------------------------
-def run_object_localization_and_label(frame):
+def run_object_label_text_detection(frame):
     """
-    Sends the frame to Cloud Vision for:
-      1) Object Localization -> bounding boxes with object names (e.g. "Bottle")
-      2) Label Detection -> general labels (e.g. "Beer", "Cosmetics", etc.)
+    Sends the frame to GCP Vision for:
+      1) Object Localization
+      2) Label Detection
+      3) Text Detection (OCR)
 
-    Returns a dict:
+    Returns a dict of:
       {
         "objects": [
           {
             "name": str,
             "score": float,
             "box": (xmin, ymin, xmax, ymax)
-          },
-          ...
+          }, ...
         ],
         "labels": [
           {
             "description": str,
             "score": float
-          },
-          ...
+          }, ...
+        ],
+        "texts": [
+          {
+            "text": str,
+            "box": [(x1, y1), (x2, y2), (x3, y3), (x4, y4)]  # corners
+          }, ...
         ]
       }
     """
     if frame is None:
-        logging.debug("run_object_localization_and_label called with None frame!")
-        return {"objects": [], "labels": []}
+        logging.debug("Frame is None - skipping detection.")
+        return {"objects": [], "labels": [], "texts": []}
 
-    # Encode the frame as JPEG
+    # Encode as JPEG
     success, encoded = cv2.imencode(".jpg", frame)
     if not success:
-        logging.error("Failed to encode frame to JPEG.")
-        return {"objects": [], "labels": []}
+        logging.error("Failed to encode frame.")
+        return {"objects": [], "labels": [], "texts": []}
 
     image = vision.Image(content=encoded.tobytes())
-    results = {"objects": [], "labels": []}
+    height, width = frame.shape[:2]
 
+    results = {
+        "objects": [],
+        "labels": [],
+        "texts": []
+    }
+
+    # ----------------------
     # 1) Object Localization
+    # ----------------------
     try:
-        obj_response = vision_client.object_localization(image=image)
-        if obj_response.error.message:
-            logging.error(f"Object localization error: {obj_response.error.message}")
+        obj_resp = vision_client.object_localization(image=image)
+        if obj_resp.error.message:
+            logging.error(f"Object localization error: {obj_resp.error.message}")
         else:
-            h, w = frame.shape[:2]
-            for obj in obj_response.localized_object_annotations:
-                xs = [v.x * w for v in obj.bounding_poly.normalized_vertices]
-                ys = [v.y * h for v in obj.bounding_poly.normalized_vertices]
+            for obj in obj_resp.localized_object_annotations:
+                xs = [v.x * width for v in obj.bounding_poly.normalized_vertices]
+                ys = [v.y * height for v in obj.bounding_poly.normalized_vertices]
                 xmin, xmax = int(min(xs)), int(max(xs))
                 ymin, ymax = int(min(ys)), int(max(ys))
                 results["objects"].append({
@@ -96,13 +110,15 @@ def run_object_localization_and_label(frame):
     except Exception as ex:
         logging.error(f"Exception calling object_localization: {ex}")
 
+    # ----------------------
     # 2) Label Detection
+    # ----------------------
     try:
-        label_response = vision_client.label_detection(image=image)
-        if label_response.error.message:
-            logging.error(f"Label detection error: {label_response.error.message}")
+        label_resp = vision_client.label_detection(image=image)
+        if label_resp.error.message:
+            logging.error(f"Label detection error: {label_resp.error.message}")
         else:
-            for lbl in label_response.label_annotations:
+            for lbl in label_resp.label_annotations:
                 results["labels"].append({
                     "description": lbl.description,
                     "score": lbl.score
@@ -110,14 +126,41 @@ def run_object_localization_and_label(frame):
     except Exception as ex:
         logging.error(f"Exception calling label_detection: {ex}")
 
+    # ----------------------
+    # 3) Text Detection (OCR)
+    # ----------------------
+    try:
+        text_resp = vision_client.text_detection(image=image)
+        if text_resp.error.message:
+            logging.error(f"Text detection error: {text_resp.error.message}")
+        else:
+            # text_annotations[0] is the entire text block,
+            # subsequent entries can be individual lines/elements
+            for i, txt in enumerate(text_resp.text_annotations):
+                # bounding_poly might have 4 vertices for a rectangle
+                poly_verts = txt.bounding_poly.vertices
+                corners = []
+                for v in poly_verts:
+                    # If x or y is None, default to 0
+                    x_val = int(v.x) if v.x else 0
+                    y_val = int(v.y) if v.y else 0
+                    corners.append((x_val, y_val))
+
+                # text is in txt.description
+                results["texts"].append({
+                    "text": txt.description,
+                    "box": corners  # list of 4 (x,y) pairs
+                })
+    except Exception as ex:
+        logging.error(f"Exception calling text_detection: {ex}")
+
     return results
 
 # --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
 def main():
-    # Create an OpenCV window
-    window_name = "Tello GCP Debug"
+    window_name = "Tello + GCP (Objects+Labels+OCR)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, FRAME_WIDTH, FRAME_HEIGHT)
 
@@ -129,7 +172,7 @@ def main():
     logging.info("Starting Tello camera stream...")
     tello.streamon()
 
-    # Give Tello a moment to start streaming
+    # Let Tello warm up
     time.sleep(2)
 
     frame_read = tello.get_frame_read()
@@ -143,44 +186,65 @@ def main():
         while True:
             frame = frame_read.frame
             if frame is None:
-                logging.debug("No frame from Tello (frame is None). Sleeping 0.1s")
+                logging.debug("No frame from Tello; sleeping 0.1s")
                 time.sleep(0.1)
                 continue
 
             frame_counter += 1
-            logging.debug(f"Got frame #{frame_counter} from Tello. Shape: {frame.shape}")
-
-            # Resize for display
+            logging.debug(f"Frame #{frame_counter} from Tello, shape={frame.shape}")
             display_frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
-            # Call combined detection
-            logging.debug("Sending frame to GCP for object + label detection...")
-            detection_results = run_object_localization_and_label(display_frame)
+            # Call all detections
+            logging.debug("Sending frame to GCP for Object+Label+OCR detection...")
+            res = run_object_label_text_detection(display_frame)
 
-            objects = detection_results["objects"]
-            labels = detection_results["labels"]
-            logging.debug(f"Object count: {len(objects)}, Label count: {len(labels)}")
+            objects = res["objects"]
+            labels = res["labels"]
+            texts = res["texts"]
 
-            # Draw bounding boxes for objects
+            logging.debug(f"Objects={len(objects)}, Labels={len(labels)}, Texts={len(texts)}")
+
+            # 1) Draw bounding boxes for objects (GREEN)
             for obj in objects:
                 (xmin, ymin, xmax, ymax) = obj["box"]
                 name = obj["name"]
                 score = obj["score"]
                 cv2.rectangle(display_frame, (xmin, ymin), (xmax, ymax), (0,255,0), 2)
-                text_str = f"{name} {score:.2f}"
-                cv2.putText(display_frame, text_str, (xmin, ymin - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                txt_str = f"{name} {score:.2f}"
+                cv2.putText(display_frame, txt_str, (xmin, ymin-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
 
-            # Show top 3 labels in the corner
+            # 2) Show top labels in top-left corner (CYAN)
             offset_y = 20
-            for lbl in labels[:3]:
-                lbl_str = f"{lbl['description']} {lbl['score']:.2f}"
-                cv2.putText(display_frame, lbl_str, (10, offset_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            for lbl in labels[:SHOW_TOP_LABELS]:
+                desc = lbl["description"]
+                score = lbl["score"]
+                label_text = f"{desc} {score:.2f}"
+                cv2.putText(display_frame, label_text, (10, offset_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
                 offset_y += 25
 
+            # 3) Draw text bounding boxes (MAGENTA) + text
+            # text_annotations[0] might be the entire block, so we do all
+            for i, t in enumerate(texts):
+                corners = t["box"]  # list of up to 4 points
+                recognized_text = t["text"].strip()
+                if not corners or len(corners) < 4:
+                    continue
+
+                # Draw polygon
+                for j in range(len(corners)):
+                    pt1 = corners[j]
+                    pt2 = corners[(j+1) % len(corners)]  # next corner, wrap around
+                    cv2.line(display_frame, pt1, pt2, (255,0,255), 2)
+
+                # If you want to overlay the text near the top-left of the box:
+                (x_text, y_text) = corners[0]
+                cv2.putText(display_frame, recognized_text, (x_text, y_text - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,255), 2)
+
             cv2.imshow(window_name, display_frame)
-            logging.debug("cv2.imshow called. Press 'q' to quit.")
+            logging.debug("Press 'q' to quit.")
 
             if WAIT_BETWEEN_FRAMES > 0:
                 time.sleep(WAIT_BETWEEN_FRAMES)
@@ -192,7 +256,7 @@ def main():
                 break
 
     except KeyboardInterrupt:
-        logging.info("KeyboardInterrupt. Exiting main loop.")
+        logging.info("KeyboardInterrupt, exiting loop.")
     finally:
         logging.info("Cleaning up...")
         tello.streamoff()
